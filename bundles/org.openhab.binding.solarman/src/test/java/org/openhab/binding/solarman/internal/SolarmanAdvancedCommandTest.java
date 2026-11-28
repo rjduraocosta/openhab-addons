@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import java.net.SocketTimeoutException;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -25,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
@@ -33,17 +35,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.openhab.binding.solarman.internal.modbus.SolarmanLoggerConnection;
 import org.openhab.binding.solarman.internal.modbus.SolarmanLoggerConnector;
 import org.openhab.binding.solarman.internal.modbus.SolarmanV5Protocol;
 import org.openhab.binding.solarman.internal.modbus.exception.SolarmanConnectionException;
 import org.openhab.binding.solarman.internal.modbus.exception.SolarmanProtocolException;
+import org.openhab.binding.solarman.internal.sunsynk.SunsynkProfile;
 import org.openhab.binding.solarman.internal.util.SolarmanWorkQueue;
 import org.openhab.core.config.core.Configuration;
 import org.openhab.core.i18n.TimeZoneProvider;
@@ -65,6 +72,7 @@ import org.openhab.core.thing.binding.builder.ThingBuilder;
 import org.openhab.core.types.Command;
 import org.openhab.core.types.RefreshType;
 import org.openhab.core.types.State;
+import org.openhab.core.types.UnDefType;
 import org.slf4j.Logger;
 
 /**
@@ -74,6 +82,221 @@ import org.slf4j.Logger;
  */
 @NonNullByDefault
 class SolarmanAdvancedCommandTest {
+    static Stream<Arguments> clockRepairCases() {
+        Stream<Arguments> repairs = SolarmanBindingConstants.SUNSYNK_PROFILES.values().stream().sorted().flatMap(
+                profile -> Stream.of(false, true).flatMap(compatibility -> Stream.of("month", "day", "calendar", "time")
+                        .map(scenario -> Arguments.of(profile, compatibility, scenario))));
+        Stream<Arguments> failures = Stream.of(false, true)
+                .flatMap(compatibility -> Stream
+                        .of("missing", "malformed", "transport", "before-year", "after-year", "type", "rejected",
+                                "readback-date", "readback-missing", "readback-transport")
+                        .map(scenario -> Arguments.of("single_phase", compatibility, scenario)));
+        return Stream.concat(repairs, failures);
+    }
+
+    @ParameterizedTest(name = "{0}, compatibility={1}, {2}")
+    @MethodSource("clockRepairCases")
+    void invalidDeviceClockCanBeRepairedWithoutWeakeningWriteValidation(String profileName, boolean compatibility,
+            String scenario) throws Exception {
+        var profile = new SunsynkProfile(profileName);
+        var sensor = profile.sensors().stream().filter(s -> "SystemTimeRWSensor".equals(s.kind())).findFirst()
+                .orElseThrow();
+        List<Integer> addresses = sensor.registers();
+        Map<Integer, byte[]> registers = new HashMap<>();
+        int month = switch (scenario) {
+            case "day", "time" -> 1;
+            case "calendar" -> 2;
+            default -> 0;
+        };
+        registers.put(addresses.get(0), new byte[] { 26, (byte) month });
+        registers.put(addresses.get(1),
+                new byte[] { (byte) ("day".equals(scenario) ? 0 : "calendar".equals(scenario) ? 30 : 1),
+                        (byte) ("time".equals(scenario) ? 24 : 12) });
+        registers.put(addresses.get(2), new byte[] { 0, 0 });
+        boolean repair = List.of("month", "day", "calendar", "time").contains(scenario);
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger writes = new AtomicInteger();
+        SolarmanLoggerConnection connection = mock(SolarmanLoggerConnection.class);
+        when(connection.isConnected()).thenReturn(true);
+        try (var connectorScope = mockConstruction(SolarmanLoggerConnector.class,
+                (connector, context) -> when(connector.createConnection()).thenReturn(connection));
+                var protocolScope = mockConstruction(SolarmanV5Protocol.class, (protocol, context) -> {
+                    when(protocol.readRegisters(any(), anyByte(), anyInt(), anyInt())).thenAnswer(invocation -> {
+                        int first = invocation.getArgument(2);
+                        int last = invocation.getArgument(3);
+                        if (first == 0) {
+                            snapshots.incrementAndGet();
+                            if ("transport".equals(scenario) && snapshots.get() == 1
+                                    || "readback-transport".equals(scenario) && snapshots.get() == 2) {
+                                throw new SolarmanConnectionException("Simulated clock read timeout");
+                            }
+                        }
+                        Map<Integer, byte[]> snapshot = new HashMap<>();
+                        for (int address = first; address <= last; address++) {
+                            snapshot.put(address, registers.getOrDefault(address, new byte[] { 0, 0 }).clone());
+                        }
+                        if (snapshots.get() == 1 && "missing".equals(scenario)
+                                || snapshots.get() == 2 && "readback-missing".equals(scenario)) {
+                            snapshot.remove(addresses.get(1));
+                        }
+                        if (snapshots.get() == 1 && "malformed".equals(scenario)
+                                && snapshot.containsKey(addresses.get(1))) {
+                            snapshot.put(addresses.get(1), new byte[] { 0 });
+                        }
+                        return snapshot;
+                    });
+                    when(protocol.writeRegisters(any(), anyInt(), any())).thenAnswer(invocation -> {
+                        writes.incrementAndGet();
+                        if ("rejected".equals(scenario)) {
+                            return false;
+                        }
+                        if (!scenario.startsWith("readback-")) {
+                            int first = invocation.getArgument(1);
+                            byte[] data = invocation.getArgument(2);
+                            for (int index = 0; index < data.length / 2; index++) {
+                                registers.put(first + index, Arrays.copyOfRange(data, index * 2, index * 2 + 2));
+                            }
+                        }
+                        return true;
+                    });
+                })) {
+            var type = compatibility
+                    ? SolarmanBindingConstants.SUNSYNK_PROFILES.entrySet().stream()
+                            .filter(entry -> profileName.equals(entry.getValue())).findFirst().orElseThrow().getKey()
+                    : SolarmanBindingConstants.THING_TYPE_SOLARMAN_LOGGER;
+            Thing thing = ThingBuilder.create(type, new ThingUID(type, "clock"))
+                    .withConfiguration(new Configuration(Map.of("hostname", "127.0.0.1", "serialNumber", "1234567890",
+                            "inverterType", "sunsynk_" + profileName, "timeZone", "UTC")))
+                    .build();
+            WorkerHandler handler = new WorkerHandler(thing);
+            handler.autoConfirm = false;
+            ChannelUID channel = new ChannelUID(thing.getUID(), "date-time");
+            DateTimeType requested = new DateTimeType("2026-07-01T12:34:56Z");
+            Command command = switch (scenario) {
+                case "before-year" -> new DateTimeType("1999-07-01T12:34:56Z");
+                case "after-year" -> new DateTimeType("2256-07-01T12:34:56Z");
+                case "type" -> new StringType("2026-07-01T12:34:56Z");
+                default -> requested;
+            };
+            try {
+                handler.initialize();
+                var protocol = protocolScope.constructed().getFirst();
+                if (repair) {
+                    Objects.requireNonNull(handler.tick.get()).run();
+                    verify(handler.callback).stateUpdated(channel, UnDefType.UNDEF);
+                    assertTrue(handler.errors.isEmpty(), handler.errors::toString);
+                    clearInvocations(protocol, handler.callback);
+                    snapshots.set(0);
+                }
+                handler.handleCommand(channel, command);
+                verify(protocol, never()).writeRegisters(any(), anyInt(), any());
+                Objects.requireNonNull(handler.tick.get()).run();
+                if (repair) {
+                    verify(protocol).writeRegisters(same(connection), eq(addresses.getFirst()),
+                            org.mockito.AdditionalMatchers.aryEq(new byte[] { 26, 7, 1, 12, 34, 56 }));
+                    assertNotNull(handler.deferred.get());
+                    verify(handler.callback, never()).stateUpdated(channel, requested);
+                    verify(protocol, times(profile.readPlan().size())).readRegisters(any(), anyByte(), anyInt(),
+                            anyInt());
+                }
+                handler.runConfirmations();
+                if (repair) {
+                    assertTrue(handler.errors.isEmpty(), handler.errors::toString);
+                    assertEquals(1, writes.get());
+                    verify(protocol, times(profile.readPlan().size() * 2)).readRegisters(any(), anyByte(), anyInt(),
+                            anyInt());
+                    verify(handler.callback).stateUpdated(channel, requested);
+                    String auditAddresses = addresses.stream()
+                            .map(address -> String.format(Locale.ROOT, "0x%04X", address))
+                            .collect(Collectors.joining(","));
+                    verify(handler.auditLogger).info(eq(
+                            "Confirmed register change: channel={}, registers=[{}], previous={}, requested={}, confirmed={}"),
+                            eq(channel), eq(auditAddresses), eq(UnDefType.UNDEF), eq(command), eq(requested));
+                    verify(handler.auditLogger, never()).warn(anyString(), any(Object[].class));
+                } else {
+                    boolean assigned = "rejected".equals(scenario) || scenario.startsWith("readback-");
+                    assertEquals(assigned ? 1 : 0, writes.get(), "An invalid clock must not introduce a write retry");
+                    assertEquals("type".equals(scenario) ? 0 : 1, handler.errors.size(), handler.errors::toString);
+                    if (!"type".equals(scenario)) {
+                        Class<? extends Exception> failureType = switch (scenario) {
+                            case "before-year", "after-year" -> IllegalArgumentException.class;
+                            case "rejected" -> SolarmanProtocolException.class;
+                            case "readback-date" -> DateTimeException.class;
+                            default -> SolarmanConnectionException.class;
+                        };
+                        assertInstanceOf(failureType, handler.errors.getFirst());
+                    }
+                    verify(handler.callback, atLeastOnce()).stateUpdated(channel, UnDefType.UNDEF);
+                    verify(handler.auditLogger, never()).info(anyString(), any(Object[].class));
+                }
+                verify(connection, atLeastOnce()).close();
+            } finally {
+                handler.dispose();
+            }
+            verify(handler.future).cancel(true);
+            verify(connectorScope.constructed().getFirst()).close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "repair", "neighbor", "outside" })
+    void invalidPreviousProgramTimeDoesNotBypassNeighborValidation(String scenario) throws Exception {
+        Map<Integer, byte[]> registers = new HashMap<>();
+        registers.put(250, new byte[] { 1, (byte) 144 }); // 04:00
+        registers.put(254, "neighbor".equals(scenario) ? new byte[] { 9, (byte) 156 } : new byte[] { 6, 64 }); // 16:00
+        registers.put(255, new byte[] { 9, (byte) 156 }); // Invalid HHMM: 2460
+        SolarmanLoggerConnection connection = mock(SolarmanLoggerConnection.class);
+        when(connection.isConnected()).thenReturn(true);
+        try (var connectorScope = mockConstruction(SolarmanLoggerConnector.class,
+                (connector, context) -> when(connector.createConnection()).thenReturn(connection));
+                var protocolScope = mockConstruction(SolarmanV5Protocol.class, (protocol, context) -> {
+                    when(protocol.readRegisters(any(), anyByte(), anyInt(), anyInt())).thenAnswer(invocation -> {
+                        Map<Integer, byte[]> snapshot = new HashMap<>();
+                        int first = invocation.getArgument(2);
+                        int last = invocation.getArgument(3);
+                        for (int address = first; address <= last; address++) {
+                            snapshot.put(address, registers.getOrDefault(address, new byte[] { 0, 0 }).clone());
+                        }
+                        return snapshot;
+                    });
+                    when(protocol.writeRegisters(any(), anyInt(), any())).thenAnswer(invocation -> {
+                        registers.put(invocation.getArgument(1), ((byte[]) invocation.getArgument(2)).clone());
+                        return true;
+                    });
+                })) {
+            Thing thing = clockThing(false, Map.of("hostname", "127.0.0.1", "serialNumber", "1234567890",
+                    "inverterType", "sunsynk_single_phase", "timeZone", "UTC"));
+            WorkerHandler handler = new WorkerHandler(thing);
+            ChannelUID channel = new ChannelUID(thing.getUID(), "prog6-time");
+            StringType requested = new StringType("outside".equals(scenario) ? "12:30" : "20:30");
+            try {
+                handler.initialize();
+                handler.handleCommand(channel, requested);
+                var protocol = protocolScope.constructed().getFirst();
+                verify(protocol, never()).writeRegisters(any(), anyInt(), any());
+                Objects.requireNonNull(handler.tick.get()).run();
+                if ("repair".equals(scenario)) {
+                    assertTrue(handler.errors.isEmpty(), handler.errors::toString);
+                    verify(protocol).writeRegisters(same(connection), eq(255),
+                            org.mockito.AdditionalMatchers.aryEq(new byte[] { 7, (byte) 238 }));
+                    verify(handler.callback).stateUpdated(channel, requested);
+                    verify(handler.auditLogger).info(eq(
+                            "Confirmed register change: channel={}, registers=[{}], previous={}, requested={}, confirmed={}"),
+                            eq(channel), eq("0x00FF"), eq(UnDefType.UNDEF), eq(requested), eq(requested));
+                } else {
+                    assertEquals(1, handler.errors.size());
+                    assertInstanceOf(IllegalArgumentException.class, handler.errors.getFirst());
+                    verify(protocol, never()).writeRegisters(any(), anyInt(), any());
+                    verify(handler.callback).stateUpdated(channel, UnDefType.UNDEF);
+                    verify(handler.auditLogger, never()).info(anyString(), any(Object[].class));
+                }
+            } finally {
+                handler.dispose();
+            }
+            verify(connectorScope.constructed().getFirst()).close();
+        }
+    }
+
     @ParameterizedTest
     @CsvSource({ "false,unset", "true,unset", "false,empty", "true,empty", "false,blank", "true,blank",
             "false,explicit", "true,explicit" })

@@ -374,7 +374,11 @@ public class SolarmanLoggerHandler extends BaseThingHandler {
                 if (attempt == 0) {
                     before = readSnapshot(current, protocol, plan, readFailures);
                     requireControlRegisters(sensor, before);
-                    previous = sensor.decode(before, zone);
+                    try {
+                        previous = sensor.decode(before, zone);
+                    } catch (java.time.DateTimeException e) {
+                        previous = UnDefType.UNDEF;
+                    }
                     return assign(current);
                 }
                 stage = "readback";
